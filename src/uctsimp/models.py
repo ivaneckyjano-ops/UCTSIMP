@@ -74,3 +74,45 @@ class SummaryRow:
     gross_eur: Decimal
     commission_eur: Decimal
     net_eur: Decimal
+
+
+@dataclass(frozen=True)
+class CashflowSummary:
+    """Súčty Net EUR: príjmy/výdaje podľa znamienka na učte (v EUR)."""
+
+    prijem_eur: Decimal
+    vydaj_eur: Decimal
+    cisty_pohyb_eur: Decimal
+
+
+@dataclass(frozen=True)
+class TaxSplitCashflow:
+    """
+    Príjmy a výdaje rozdelené na daňovo orientované vs nedaňové toky
+    (vklady/výbery podľa heuristiky v tax_relevance).
+    """
+
+    prijem_danovy_eur: Decimal
+    prijem_nedanovy_eur: Decimal
+    vydaj_danovy_eur: Decimal
+    vydaj_nedanovy_eur: Decimal
+    cisty_danovy_eur: Decimal
+    cisty_nedanovy_eur: Decimal
+
+
+@dataclass(frozen=True)
+class DailyNetRow:
+    obchodny_den: str
+    denna_zmena_eur: Decimal
+    kumulativ_eur: Decimal
+
+
+@dataclass(frozen=True)
+class TaxDetailLine:
+    """Jeden riadok do rozpisu daň. príjmu alebo výdaja (kontrola, párovanie)."""
+
+    transaction_id: int
+    trade_date: str
+    amount_eur: Decimal
+    description: str
+    source: str

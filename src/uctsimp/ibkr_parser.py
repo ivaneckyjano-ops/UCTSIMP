@@ -10,7 +10,8 @@ from typing import Iterable
 
 from .models import RawImport, StatementMetadata, Transaction, TransactionCategory
 
-MONEY_QUANT = Decimal("0.000001")
+# Zaokrúhlenie peňažných údajov a EUR (polovičné zaokrúhlenie vždy hore smerom od nuly)
+MONEY_QUANT = Decimal("0.01")
 
 
 class IbkrParseError(ValueError):
@@ -96,13 +97,13 @@ def _transaction_from_payload(
     instrument_type = _instrument_type(symbol)
     transaction_type = _clean_text(payload.get("Transaction Type")) or "Unknown"
     category = _category_for(transaction_type, description)
-    quantity = _decimal_or_none(payload.get("Quantity"))
-    price = _decimal_or_none(payload.get("Price"))
+    quantity = _money2(_decimal_or_none(payload.get("Quantity")))
+    price = _money2(_decimal_or_none(payload.get("Price")))
     price_currency = _empty_to_none(payload.get("Price Currency"))
-    gross_amount = _decimal_or_zero(payload.get("Gross Amount"))
-    commission = _decimal_or_zero(payload.get("Commission"))
-    net_amount = _decimal_or_zero(payload.get("Net Amount"))
-    transaction_fees = _decimal_or_zero(payload.get("Transaction Fees"))
+    gross_amount = _money2(_decimal_or_zero(payload.get("Gross Amount")))
+    commission = _money2(_decimal_or_zero(payload.get("Commission")))
+    net_amount = _money2(_decimal_or_zero(payload.get("Net Amount")))
+    transaction_fees = _money2(_decimal_or_zero(payload.get("Transaction Fees")))
     exchange_rate = _decimal_or_zero(payload.get("Exchange Rate")) or Decimal("1")
 
     row_hash = _row_hash(payload, occurrence)
@@ -167,6 +168,12 @@ def _decimal_or_none(value: str | None) -> Decimal | None:
 
 def _decimal_or_zero(value: str | None) -> Decimal:
     return _decimal_or_none(value) or Decimal("0")
+
+
+def _money2(value: Decimal | None) -> Decimal | None:
+    if value is None:
+        return None
+    return value.quantize(MONEY_QUANT, rounding=ROUND_HALF_UP)
 
 
 def _amount_to_eur(

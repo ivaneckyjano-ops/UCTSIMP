@@ -4,7 +4,21 @@ import sqlite3
 from decimal import Decimal
 from pathlib import Path
 
-from .models import SummaryRow
+from .fifo_realized import fifo_danove_z_db
+from .models import CashflowSummary, DailyNetRow, SummaryRow, TaxSplitCashflow
+from .tax_relevance import sql_nedanove_kategorie_in
+
+GROSS_EUR_VYSVETLENIE = (
+    "Stlpec **Gross EUR** v prehlade pod tickermi (a v suhrne pod kategoriou `trade`) je sucet stlpca "
+    "„Gross Amount“ z IBKR pre riadky Buy/Sell, prevedeny do **EUR** — ide o **ciastkove (hrube) nohy obchodu**, "
+    "nie o **zrealizovany vysledok (realized P&L)** z uzavretych pozicii. Ten by vyzadoval sparovanie nákupu "
+    "a predaja (FIFO, opcie, expirácia atd.).\n\n"
+    "Na penazny dopad a cashflow sa pozerajte na stlpec **Net EUR** (netto po provizii) a na zalozku **Prehlad** "
+    "— sučet príjmov, výdajov a bežiaci kumulativ z importu.\n\n"
+    "Riadok **danovy (FIFO)**: u obchodov (`trade`) sa nepouziva cisty Net z kazdeho riadka; pocita sa "
+    "**realizovany vysledok** po symboli (FIFO) — teda az pri uzatvaracich nákup+predaj. Otvorene nohy: 0. "
+    "Vklady a vybery: neda. Ostatne kategorie: Net EUR. Over s danovym poradcom."
+)
 
 
 def ticker_summary(connection: sqlite3.Connection) -> list[SummaryRow]:
@@ -38,6 +52,169 @@ def category_summary(connection: sqlite3.Connection) -> list[SummaryRow]:
         ORDER BY category
         """,
     )
+
+
+def cashflow_summary(connection: sqlite3.Connection) -> CashflowSummary:
+    row = connection.execute(
+        """
+        SELECT
+            COALESCE(
+                SUM(
+                    CASE
+                        WHEN CAST(net_amount_eur AS REAL) > 0
+                        THEN CAST(net_amount_eur AS REAL)
+                        ELSE 0.0
+                    END
+                ),
+                0.0
+            ) AS prijem,
+            COALESCE(
+                SUM(
+                    CASE
+                        WHEN CAST(net_amount_eur AS REAL) < 0
+                        THEN -CAST(net_amount_eur AS REAL)
+                        ELSE 0.0
+                    END
+                ),
+                0.0
+            ) AS vydaj,
+            COALESCE(SUM(CAST(net_amount_eur AS REAL)), 0.0) AS cisty
+        FROM transactions
+        """
+    ).fetchone()
+    assert row is not None
+    return CashflowSummary(
+        prijem_eur=_decimal_from_sql(row["prijem"]),
+        vydaj_eur=_decimal_from_sql(row["vydaj"]),
+        cisty_pohyb_eur=_decimal_from_sql(row["cisty"]),
+    )
+
+
+def tax_split_cashflow(connection: sqlite3.Connection) -> TaxSplitCashflow:
+    """
+    Neda: vklady/vybery. Dan netrade: provizia, uroky, … podla Net EUR.
+    Obchody (`trade`): **iba realizovany** vysledok (FIFO) — parovane/uzatvaraci predaj proti naku
+    otvorene nohy: 0 v dan. obch. casti.
+    """
+    in_list = sql_nedanove_kategorie_in()
+    row = connection.execute(
+        f"""
+        SELECT
+            COALESCE(
+                SUM(
+                    CASE
+                        WHEN CAST(net_amount_eur AS REAL) > 0
+                             AND category NOT IN ({in_list})
+                             AND category != 'trade'
+                        THEN CAST(net_amount_eur AS REAL)
+                        ELSE 0.0
+                    END
+                ),
+                0.0
+            ) AS prijem_dan_net,
+            COALESCE(
+                SUM(
+                    CASE
+                        WHEN CAST(net_amount_eur AS REAL) > 0
+                             AND category IN ({in_list})
+                        THEN CAST(net_amount_eur AS REAL)
+                        ELSE 0.0
+                    END
+                ),
+                0.0
+            ) AS prijem_nedan,
+            COALESCE(
+                SUM(
+                    CASE
+                        WHEN CAST(net_amount_eur AS REAL) < 0
+                             AND category NOT IN ({in_list})
+                             AND category != 'trade'
+                        THEN -CAST(net_amount_eur AS REAL)
+                        ELSE 0.0
+                    END
+                ),
+                0.0
+            ) AS vydaj_dan_net,
+            COALESCE(
+                SUM(
+                    CASE
+                        WHEN CAST(net_amount_eur AS REAL) < 0
+                             AND category IN ({in_list})
+                        THEN -CAST(net_amount_eur AS REAL)
+                        ELSE 0.0
+                    END
+                ),
+                0.0
+            ) AS vydaj_nedan,
+            COALESCE(
+                SUM(
+                    CASE
+                        WHEN category NOT IN ({in_list})
+                         AND category != 'trade'
+                        THEN CAST(net_amount_eur AS REAL)
+                        ELSE 0.0
+                    END
+                ),
+                0.0
+            ) AS cisty_dan_net,
+            COALESCE(
+                SUM(
+                    CASE
+                        WHEN category IN ({in_list})
+                        THEN CAST(net_amount_eur AS REAL)
+                        ELSE 0.0
+                    END
+                ),
+                0.0
+            ) AS cisty_nedan
+        FROM transactions
+        """
+    ).fetchone()
+    assert row is not None
+    t_pr, t_vd, t_c = fifo_danove_z_db(connection)
+    p_dan = _decimal_from_sql(row["prijem_dan_net"]) + t_pr
+    v_dan = _decimal_from_sql(row["vydaj_dan_net"]) + t_vd
+    c_dan = _decimal_from_sql(row["cisty_dan_net"]) + t_c
+    return TaxSplitCashflow(
+        prijem_danovy_eur=p_dan,
+        prijem_nedanovy_eur=_decimal_from_sql(row["prijem_nedan"]),
+        vydaj_danovy_eur=v_dan,
+        vydaj_nedanovy_eur=_decimal_from_sql(row["vydaj_nedan"]),
+        cisty_danovy_eur=c_dan,
+        cisty_nedanovy_eur=_decimal_from_sql(row["cisty_nedan"]),
+    )
+
+
+def daily_cumulative_net(connection: sqlite3.Connection) -> list[DailyNetRow]:
+    """Denné súčty Net EUR a kumulatív od prvého dátumu v (importe) databáze."""
+    cur = connection.execute(
+        """
+        WITH den AS (
+            SELECT
+                trade_date,
+                SUM(CAST(net_amount_eur AS REAL)) AS denna_zmena
+            FROM transactions
+            GROUP BY trade_date
+        )
+        SELECT
+            trade_date,
+            denna_zmena,
+            SUM(denna_zmena) OVER (
+                ORDER BY trade_date
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            ) AS kumulativ
+        FROM den
+        ORDER BY trade_date
+        """
+    )
+    return [
+        DailyNetRow(
+            obchodny_den=str(r["trade_date"]),
+            denna_zmena_eur=_decimal_from_sql(r["denna_zmena"]),
+            kumulativ_eur=_decimal_from_sql(r["kumulativ"]),
+        )
+        for r in cur.fetchall()
+    ]
 
 
 def yearly_summary(connection: sqlite3.Connection) -> list[SummaryRow]:
@@ -79,6 +256,42 @@ def export_excel(connection: sqlite3.Connection, path: str | Path) -> None:
     _write_summary_block(summary_sheet, "Podla tickerov", ticker_summary(connection), 1)
     _write_summary_block(summary_sheet, "Podla kategorii", category_summary(connection), 1 + len(ticker_summary(connection)) + 4)
     _write_summary_block(summary_sheet, "Podla rokov", yearly_summary(connection), 1 + len(ticker_summary(connection)) + len(category_summary(connection)) + 8)
+
+    flow = cashflow_summary(connection)
+    tax = tax_split_cashflow(connection)
+    flow_sheet = workbook.create_sheet("PrijemVydaj")
+    flow_sheet.append(["Polozka", "EUR"])
+    flow_sheet.append(["Celkovo: Prijem (sucet kladnych Net EUR)", float(flow.prijem_eur)])
+    flow_sheet.append(["Celkovo: Vydaj (sucet |zapornych| Net EUR)", float(flow.vydaj_eur)])
+    flow_sheet.append(["Celkovo: Cisty pohyb (sucet vsetkych Net EUR)", float(flow.cisty_pohyb_eur)])
+    flow_sheet.append([])
+    flow_sheet.append(
+        ["Danovy: Prijem (ostatne Net + FIFO realiz. obchodov)", float(tax.prijem_danovy_eur)]
+    )
+    flow_sheet.append(
+        ["Danovy: Vydaj (ostatne + |FIFO zapor. realiz.|)", float(tax.vydaj_danovy_eur)]
+    )
+    flow_sheet.append(
+        ["Danovy: Cisty (ostatne Net + suhrn FIFO obchodov)", float(tax.cisty_danovy_eur)]
+    )
+    flow_sheet.append([])
+    flow_sheet.append(["Nedanovy tok: Prijem (kl - vklady...)", float(tax.prijem_nedanovy_eur)])
+    flow_sheet.append(["Nedanovy tok: Vydaj (|zap.| vybery...)", float(tax.vydaj_nedanovy_eur)])
+    flow_sheet.append(["Nedanovy tok: Cisty (sucet Net v nedan. kateg.)", float(tax.cisty_nedanovy_eur)])
+    flow_sheet.append([])
+    flow_sheet.append(
+        [
+            "Poznamka k Gross EUR a dan/ neda",
+            GROSS_EUR_VYSVETLENIE.replace("\n\n", " ").replace("**", ""),
+        ]
+    )
+
+    kum_sheet = workbook.create_sheet("Kumulativ")
+    kum_sheet.append(["Datum", "Denna zmena Net EUR", "Kumulativ Net EUR"])
+    for r in daily_cumulative_net(connection):
+        kum_sheet.append(
+            [r.obchodny_den, float(r.denna_zmena_eur), float(r.kumulativ_eur)]
+        )
 
     transaction_sheet = workbook.create_sheet("Transakcie")
     transaction_headers = [
@@ -178,7 +391,7 @@ def _write_summary_block(
 def _decimal_from_sql(value) -> Decimal:
     if value is None:
         return Decimal("0")
-    return Decimal(str(value)).quantize(Decimal("0.000001"))
+    return Decimal(str(value)).quantize(Decimal("0.01"))
 
 
 def _number_or_text(value: str | None):

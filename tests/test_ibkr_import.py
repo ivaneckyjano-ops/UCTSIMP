@@ -5,7 +5,14 @@ from pathlib import Path
 from uctsimp.database import connect, import_raw
 from uctsimp.ibkr_parser import parse_ibkr_csv
 from uctsimp.models import TransactionCategory
-from uctsimp.reports import category_summary, export_excel, ticker_summary
+from uctsimp.reports import (
+    cashflow_summary,
+    category_summary,
+    daily_cumulative_net,
+    export_excel,
+    tax_split_cashflow,
+    ticker_summary,
+)
 
 
 SAMPLE_CSV = """Statement,Header,Field Name,Field Value
@@ -33,7 +40,7 @@ def test_parser_reads_transaction_history(tmp_path: Path) -> None:
     assert trade.ticker == "AMZN"
     assert trade.instrument_type == "option"
     assert trade.category == TransactionCategory.TRADE
-    assert str(trade.net_amount_eur) == "-228.554625"
+    assert str(trade.net_amount_eur) == "-228.55"
 
 
 def test_import_skips_duplicates(tmp_path: Path) -> None:
@@ -66,3 +73,22 @@ def test_reports_and_export(tmp_path: Path) -> None:
     assert categories["fee"].trade_count == 1
     assert categories["deposit_withdrawal"].trade_count == 1
     assert export_path.exists()
+
+    flow = cashflow_summary(connection)
+    assert str(flow.prijem_eur) == "1000.04"
+    assert str(flow.vydaj_eur) == "237.01"
+    assert str(flow.cisty_pohyb_eur) == "763.03"
+
+    tax = tax_split_cashflow(connection)
+    # Obchod: 1x nákup opcie bez preda — FIFO realizácia 0; dan z obchodov = 0. Poplatok + úrok: Net.
+    assert str(tax.prijem_danovy_eur) == "0.04"
+    assert str(tax.prijem_nedanovy_eur) == "1000.00"
+    assert str(tax.vydaj_danovy_eur) == "8.46"
+    assert str(tax.vydaj_nedanovy_eur) == "0.00"
+    assert str(tax.cisty_danovy_eur) == "-8.42"
+    assert str(tax.cisty_nedanovy_eur) == "1000.00"
+
+    days = daily_cumulative_net(connection)
+    assert len(days) == 4
+    assert days[-1].obchodny_den == "2026-03-31"
+    assert str(days[-1].kumulativ_eur) == "763.03"

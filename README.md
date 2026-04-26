@@ -35,6 +35,14 @@ pracuje s koreňom projektu UCTSIMP (kde je `src/uctsimp`), nie s vyššími zlo
 Súbory mimo tohto priečinka Git **nevidí** a na GitHub sa neodošlú. Do repozitára nepatria
 lokálne veci zo `.gitignore` (napr. `.venv/`, testovacie databázy).
 
+## Gross EUR vs Net EUR vs cashflow
+
+- **Gross EUR** v tabuľke pod tickermi je súčet IBKR „Gross“ len pre `Buy`/`Sell` (nie
+  zrealizovaný zisk uzavretých pozícií).
+- **Net EUR** je penažny dopad po provízii, v tabuľke **Prehľad** je **príjem** (súčet
+  kladných Net), **výdaj** (súčet absolútnych záporných) a **čistý pohyb**; denný
+  **kumulatív** je z importu (nie nutne zhodné so stavom účtu v TWS, ak chýba história).
+
 ## Ulozenie do GitHub
 
 V okne je tlacidlo **Ulozit do GitHub (git push)**: urobi `git add`, `commit` a `push` na
