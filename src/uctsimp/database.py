@@ -1,25 +1,105 @@
 from __future__ import annotations
 
 import json
+import re
+import shutil
 import sqlite3
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 from .models import ImportResult, RawImport, Transaction
 
 APP_DIR = Path.home() / ".local" / "share" / "uctsimp"
-DEFAULT_DB_PATH = APP_DIR / "uctsimp.sqlite3"
+DATA_DIR = APP_DIR / "data"
+SETTINGS_PATH = APP_DIR / "settings.json"
+# Starý jeden súbor (pred ročným rozčlenením) — po migrácii sa premenuje
+LEGACY_DB_PATH = APP_DIR / "uctsimp.sqlite3"
 
 
-def connect(db_path: str | Path | None = None) -> sqlite3.Connection:
-    path = Path(db_path) if db_path is not None else DEFAULT_DB_PATH
+def _default_year() -> int:
+    y = date.today().year
+    if y < 2000 or y > 2100:
+        return 2026
+    return y
+
+
+def ensure_data_dir() -> Path:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    return DATA_DIR
+
+
+def path_for_year(year: int) -> Path:
+    if year < 2000 or year > 2100:
+        raise ValueError("rok mimo rozsah 2000–2100")
+    ensure_data_dir()
+    return DATA_DIR / f"uctsimp_{year}.sqlite3"
+
+
+def list_years_on_disk() -> list[int]:
+    if not DATA_DIR.is_dir():
+        return []
+    out: list[int] = []
+    for p in DATA_DIR.glob("uctsimp_*.sqlite3"):
+        m = re.match(r"^uctsimp_(\d{4})\.sqlite3$", p.name, re.IGNORECASE)
+        if m:
+            y = int(m.group(1))
+            if 2000 <= y <= 2100:
+                out.append(y)
+    return sorted(out)
+
+
+def load_active_year() -> int:
+    try:
+        if SETTINGS_PATH.is_file():
+            data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+            y = int(data.get("active_year", _default_year()))
+            if 2000 <= y <= 2100:
+                return y
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return _default_year()
+
+
+def save_active_year(year: int) -> None:
+    if year < 2000 or year > 2100:
+        raise ValueError("rok mimo rozsah")
+    ensure_data_dir()
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    data: dict[str, Any] = {}
+    if SETTINGS_PATH.is_file():
+        try:
+            data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            data = {}
+    data["active_year"] = year
+    SETTINGS_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def get_default_connection_path() -> Path:
+    """Aktuálna databáza podľa uloženého roka."""
+    return path_for_year(load_active_year())
+
+
+def _open_db_file(path: Path) -> sqlite3.Connection:
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     migrate(connection)
     return connection
+
+
+def connect(db_path: str | Path | None = None) -> sqlite3.Connection:
+    if db_path is not None:
+        return _open_db_file(Path(db_path))
+    return _open_db_file(get_default_connection_path())
+
+
+def connect_for_year(year: int) -> sqlite3.Connection:
+    return _open_db_file(path_for_year(year))
 
 
 def migrate(connection: sqlite3.Connection) -> None:
@@ -75,6 +155,93 @@ def migrate(connection: sqlite3.Connection) -> None:
     connection.commit()
 
 
+def migrate_legacy_to_per_year() -> str | None:
+    """
+    Ak existuje len starý uctsimp.sqlite3 s dátami a ešte nie sú ročné súbory,
+    rozdelí transakcie do data/uctsimp_YYYY.sqlite3 a pôvodný súbor premenuje.
+    Vráti text pre používateľa alebo None.
+    """
+    if not LEGACY_DB_PATH.is_file():
+        return None
+    ensure_data_dir()
+    if list_years_on_disk():
+        return None
+    try:
+        src = sqlite3.connect(LEGACY_DB_PATH)
+    except OSError:
+        return None
+    src.row_factory = sqlite3.Row
+    n = int(src.execute("SELECT COUNT(*) AS c FROM transactions").fetchone()["c"])
+    if n == 0:
+        src.close()
+        return None
+    years_rows = src.execute(
+        "SELECT DISTINCT substr(trade_date,1,4) AS y FROM transactions WHERE length(trade_date) >= 4 ORDER BY y"
+    ).fetchall()
+    years: list[int] = []
+    for r in years_rows:
+        ys = (r["y"] or "").strip()
+        if len(ys) == 4 and ys.isdigit():
+            years.append(int(ys))
+    if not years:
+        src.close()
+        return None
+
+    for y in years:
+        p = path_for_year(y)
+        if p.is_file():
+            continue
+        dst = sqlite3.connect(p)
+        dst.row_factory = sqlite3.Row
+        migrate(dst)
+        txs = list(
+            src.execute(
+                "SELECT * FROM transactions WHERE trade_date >= ? AND trade_date < ? ORDER BY id",
+                (f"{y}-01-01", f"{y + 1}-01-01"),
+            )
+        )
+        if not txs:
+            dst.close()
+            p.unlink(missing_ok=True)
+            continue
+        old_fids = sorted({int(r["import_file_id"]) for r in txs})
+        id_map: dict[int, int] = {}
+        for old_fid in old_fids:
+            frow = src.execute("SELECT * FROM import_files WHERE id = ?", (old_fid,)).fetchone()
+            if frow is None:
+                continue
+            keys = [k for k in frow.keys() if k != "id"]
+            ph = ", ".join("?" * len(keys))
+            dst.execute(
+                f"INSERT INTO import_files ({', '.join(keys)}) VALUES ({ph})",
+                tuple(frow[k] for k in keys),
+            )
+            new_id = int(dst.execute("SELECT last_insert_rowid()").fetchone()[0])
+            id_map[old_fid] = new_id
+        tkeys = [k for k in txs[0].keys() if k != "id"]
+        for r in txs:
+            vals = [id_map[int(r["import_file_id"])] if k == "import_file_id" else r[k] for k in tkeys]
+            ph = ", ".join("?" * len(tkeys))
+            dst.execute(
+                f"INSERT INTO transactions ({', '.join(tkeys)}) VALUES ({ph})",
+                tuple(vals),
+            )
+        dst.commit()
+        dst.close()
+
+    src.close()
+    try:
+        bak = APP_DIR / "uctsimp_pred_ročnou_migráciou.sqlite3.bak"
+        LEGACY_DB_PATH.rename(bak)
+    except OSError:
+        pass
+    y_min, y_max = min(years), max(years)
+    return (
+        f"Migrácia: stará databáza sa rozčlenila do rokov {y_min}–{y_max} "
+        f"(priečinok dát: {DATA_DIR}). Pôvodný súbor je zálohovaný."
+    )
+
+
 def import_raw(connection: sqlite3.Connection, raw_import: RawImport) -> ImportResult:
     with connection:
         import_file_id = _insert_or_get_import_file(connection, raw_import)
@@ -92,6 +259,30 @@ def import_raw(connection: sqlite3.Connection, raw_import: RawImport) -> ImportR
         skipped_duplicates=skipped,
         total_rows=len(raw_import.transactions),
     )
+
+
+def clear_all_data(connection: sqlite3.Connection) -> tuple[int, int]:
+    n_tx = int(
+        connection.execute("SELECT COUNT(*) AS c FROM transactions").fetchone()["c"]
+    )
+    n_f = int(
+        connection.execute("SELECT COUNT(*) AS c FROM import_files").fetchone()["c"]
+    )
+    with connection:
+        connection.execute("DELETE FROM transactions")
+        connection.execute("DELETE FROM import_files")
+    return (n_tx, n_f)
+
+
+def backup_year_database(db_path: Path, destination: Path) -> None:
+    shutil.copy2(Path(db_path), Path(destination))
+
+
+def restore_year_from_file(source: Path, year: int) -> None:
+    """Prepíše databázu daného roka kópiou (volajte po zatvorení pripojenia)."""
+    dest = path_for_year(year)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(Path(source), dest)
 
 
 def _insert_or_get_import_file(

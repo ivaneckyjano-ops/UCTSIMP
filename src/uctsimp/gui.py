@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import sys
+from functools import partial
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -23,8 +25,22 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .database import DEFAULT_DB_PATH, connect, import_raw
+from .database import (
+    APP_DIR,
+    DATA_DIR,
+    backup_year_database,
+    clear_all_data,
+    connect_for_year,
+    import_raw,
+    list_years_on_disk,
+    load_active_year,
+    migrate_legacy_to_per_year,
+    path_for_year,
+    restore_year_from_file,
+    save_active_year,
+)
 from .dev_tests import run_pytest
+from .version_info import get_package_version
 from .git_sync import commit_all_and_push
 from .ibkr_parser import IbkrParseError, parse_ibkr_csv
 from .restart import spawn_new_uctsimp_instance
@@ -35,6 +51,7 @@ from .reports import (
     daily_cumulative_net,
     export_excel,
     review_rows,
+    tax_danove_rozpis,
     tax_split_cashflow,
     ticker_summary,
     yearly_summary,
@@ -44,17 +61,46 @@ from .reports import (
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("UCTSIMP - IBKR dane")
+        self._app_version = get_package_version()
         self.resize(1000, 700)
-        self.connection = connect()
 
-        self.status_label = QLabel(f"Databaza: {DEFAULT_DB_PATH}")
+        mig_msg = migrate_legacy_to_per_year()
+        yrs = list_years_on_disk()
+        self._active_year = load_active_year()
+        if yrs and self._active_year not in yrs:
+            self._active_year = max(yrs)
+        save_active_year(self._active_year)
+        self.connection = connect_for_year(self._active_year)
+
+        self.setWindowTitle(
+            f"UCTSIMP {self._app_version} – {self._active_year} – IBKR dane"
+        )
+        if mig_msg:
+            QTimer.singleShot(
+                0,
+                partial(
+                    QMessageBox.information,
+                    self,
+                    "Migrácia databázy",
+                    mig_msg,
+                ),
+            )
+
+        self.status_label = QLabel()
         self.import_button = QPushButton("Importovat IBKR CSV")
         self.export_button = QPushButton("Exportovat Excel")
         self.refresh_button = QPushButton("Obnovit")
         self.github_button = QPushButton("Ulozit do GitHub (git push)")
         self.test_button = QPushButton("Spusti testy (pytest)")
         self.restart_button = QPushButton("Reštartovať aplikáciu")
+        self.clear_data_button = QPushButton("Vymazať dáta pre rok")
+        self.clear_data_button.setToolTip(
+            f"Zmaže všetky transakcie len v súbore pre zvolený rok (priečinok: {DATA_DIR}). "
+            "Ostatné roky ostanú nedotknuté. Súbory CSV/PDF na disku sa nemenia."
+        )
+        self.about_button = QPushButton("O programe")
+        self.about_button.clicked.connect(self.show_about)
+        self.clear_data_button.clicked.connect(self.clear_imported_data)
         self.test_button.setToolTip(
             "Otvorí okno s výsledkom pytest (nie je to zmena dát v tabuľkách). Hlavné okno sa nemení; "
             "upravený kód v bežacej aplikácii (GUI) uvidíš až po reštarte, ale jadro sa testuje v novom procese."
@@ -73,10 +119,36 @@ class MainWindow(QMainWindow):
         button_row.addWidget(self.import_button)
         button_row.addWidget(self.export_button)
         button_row.addWidget(self.refresh_button)
+        button_row.addWidget(self.clear_data_button)
         button_row.addWidget(self.github_button)
         button_row.addWidget(self.test_button)
         button_row.addWidget(self.restart_button)
+        button_row.addWidget(self.about_button)
         button_row.addStretch()
+
+        year_row = QHBoxLayout()
+        year_row.addWidget(QLabel("Rok dát:"))
+        self._year_combo = QComboBox()
+        self._year_combo.setMinimumWidth(110)
+        self._year_combo.activated.connect(self._on_year_combo_activated)
+        year_row.addWidget(self._year_combo)
+        self._new_year_btn = QPushButton("Nový rok…")
+        self._new_year_btn.setToolTip(
+            "Otvorí alebo vytvorí samostatnú SQLite databázu pre zadaný rok (jeden súbor = jeden rok)."
+        )
+        self._new_year_btn.clicked.connect(self._add_year_dialog)
+        year_row.addWidget(self._new_year_btn)
+        self._backup_btn = QPushButton("Zálohovať rok…")
+        self._backup_btn.setToolTip("Skopíruje .sqlite3 súbor aktuálne zvoleného roka (záloha na iný disk/USB).")
+        self._backup_btn.clicked.connect(self._backup_current_year)
+        year_row.addWidget(self._backup_btn)
+        self._restore_btn = QPushButton("Obnoviť rok…")
+        self._restore_btn.setToolTip(
+            "Prepíše databázu zvoleného roka kópiou zo záložného .sqlite3 súboru. Aktuálny súbor bude stratený."
+        )
+        self._restore_btn.clicked.connect(self._restore_current_year)
+        year_row.addWidget(self._restore_btn)
+        year_row.addStretch()
 
         self.tabs = QTabWidget()
         self.overview_explain = QLabel()
@@ -104,6 +176,32 @@ class MainWindow(QMainWindow):
         self.cashflow_table.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
+        self._tax_danove_toggle = QToolButton()
+        self._tax_danove_toggle.setText(
+            "Rozpis daňových príjmov a výdajov (dátum, suma, zdroj — kontrola / párovanie)"
+        )
+        self._tax_danove_toggle.setCheckable(True)
+        self._tax_danove_toggle.setChecked(False)
+        self._tax_danove_toggle.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextBesideIcon
+        )
+        self._tax_danove_toggle.setArrowType(Qt.ArrowType.RightArrow)
+        self._tax_prijem_table = QTableWidget()
+        self._tax_vydaj_table = QTableWidget()
+        for _t in (self._tax_prijem_table, self._tax_vydaj_table):
+            _t.setSizePolicy(
+                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+            )
+        _tax_rozpis_tabs = QTabWidget()
+        _tax_rozpis_tabs.addTab(self._tax_prijem_table, "Príjmy (daň)")
+        _tax_rozpis_tabs.addTab(self._tax_vydaj_table, "Výdaje (daň)")
+        _tax_danove_inner = QVBoxLayout()
+        _tax_danove_inner.setContentsMargins(8, 4, 8, 8)
+        _tax_danove_inner.addWidget(_tax_rozpis_tabs)
+        self._tax_danove_box = QFrame()
+        self._tax_danove_box.setLayout(_tax_danove_inner)
+        self._tax_danove_box.setVisible(False)
+        self._tax_danove_toggle.toggled.connect(self._on_tax_danove_toggled)
         self.daily_table = QTableWidget()
         self.ticker_table = QTableWidget()
         self.category_table = QTableWidget()
@@ -127,6 +225,8 @@ class MainWindow(QMainWindow):
             QLabel("Príjmy, výdaje, čistý pohyb (Net EUR) — všetky importované transakcie")
         )
         overview_layout.addWidget(self.cashflow_table, stretch=1)
+        overview_layout.addWidget(self._tax_danove_toggle)
+        overview_layout.addWidget(self._tax_danove_box)
         overview_widget.setLayout(overview_layout)
 
         daily_widget = QWidget()
@@ -152,17 +252,188 @@ class MainWindow(QMainWindow):
 
         layout = QVBoxLayout()
         layout.addLayout(button_row)
+        layout.addLayout(year_row)
         layout.addWidget(self.status_label)
         layout.addWidget(self.tabs, stretch=1)
 
         container = QWidget()
         container.setLayout(layout)
         self.setCentralWidget(container)
+        self._sync_year_combo()
+        self._set_status_line(
+            f"Rok {self._active_year}: {self._current_db_path()} · Koreň: {APP_DIR}"
+        )
         self.refresh_tables()
+
+    def _set_status_line(self, detail: str) -> None:
+        self.status_label.setText(f"Verzia {self._app_version} · {detail}")
+
+    def _current_db_path(self) -> Path:
+        return path_for_year(self._active_year)
+
+    def _sync_year_combo(self) -> None:
+        self._year_combo.blockSignals(True)
+        self._year_combo.clear()
+        years = set(list_years_on_disk())
+        years.add(self._active_year)
+        for y in sorted(years):
+            self._year_combo.addItem(str(y), y)
+        idx = self._year_combo.findData(self._active_year)
+        if idx >= 0:
+            self._year_combo.setCurrentIndex(idx)
+        self._year_combo.blockSignals(False)
+        self.setWindowTitle(
+            f"UCTSIMP {self._app_version} – {self._active_year} – IBKR dane"
+        )
+
+    def _on_year_combo_activated(self, index: int) -> None:
+        data = self._year_combo.itemData(index)
+        if data is None:
+            return
+        y = int(data)
+        if y == self._active_year:
+            return
+        self._active_year = y
+        save_active_year(y)
+        self.connection.close()
+        self.connection = connect_for_year(y)
+        self.refresh_tables()
+        self._set_status_line(
+            f"Rok {y}: {self._current_db_path()}"
+        )
+
+    def _add_year_dialog(self) -> None:
+        y, ok = QInputDialog.getInt(
+            self,
+            "Nový rok",
+            "Kalendárny rok (vytvorí alebo otvorí samostatnú databázu):",
+            self._active_year,
+            2000,
+            2100,
+            1,
+        )
+        if not ok:
+            return
+        self._active_year = y
+        save_active_year(y)
+        self.connection.close()
+        self.connection = connect_for_year(y)
+        self._sync_year_combo()
+        self.refresh_tables()
+        self._set_status_line(
+            f"Rok {y}: {self._current_db_path()}"
+        )
+
+    def _backup_current_year(self) -> None:
+        src = self._current_db_path()
+        if not src.is_file():
+            QMessageBox.warning(
+                self,
+                "Záloha",
+                "Súbor databázy pre tento rok ešte neexistuje (žiadne dáta).",
+            )
+            return
+        dest, _ = QFileDialog.getSaveFileName(
+            self,
+            "Uložiť kópiu SQLite",
+            str(Path.home() / f"uctsimp_{self._active_year}_zaloha.sqlite3"),
+            "SQLite (*.sqlite3);;Všetky (*)",
+        )
+        if not dest:
+            return
+        try:
+            backup_year_database(src, Path(dest))
+        except OSError as exc:
+            QMessageBox.critical(self, "Záloha", str(exc))
+            return
+        QMessageBox.information(self, "Záloha", f"Uložené do:\n{dest}")
+
+    def _restore_current_year(self) -> None:
+        reply = QMessageBox.warning(
+            self,
+            "Obnoviť databázu roka",
+            f"Aktuálna databáza pre rok {self._active_year} bude nahradená obsahom vybraného súboru.\n\n"
+            f"Cieľ: {self._current_db_path()}\n\n"
+            "Najprv môžete zvoliť „Zálohovať rok…“ (odporúčané).",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        src, _ = QFileDialog.getOpenFileName(
+            self,
+            "Záložný súbor SQLite",
+            str(Path.home()),
+            "SQLite (*.sqlite3);;Všetky (*)",
+        )
+        if not src:
+            return
+        self.connection.close()
+        try:
+            restore_year_from_file(Path(src), self._active_year)
+        except OSError as exc:
+            self.connection = connect_for_year(self._active_year)
+            QMessageBox.critical(self, "Obnova", str(exc))
+            self.refresh_tables()
+            return
+        self.connection = connect_for_year(self._active_year)
+        self._sync_year_combo()
+        self.refresh_tables()
+        self._set_status_line(
+            f"Rok {self._active_year} obnovený z: {src}"
+        )
+        QMessageBox.information(
+            self,
+            "Obnova",
+            f"Dáta pre rok {self._active_year} boli načítané zo zálohy.",
+        )
+
+    def show_about(self) -> None:
+        QMessageBox.about(
+            self,
+            "O programe UCTSIMP",
+            f"<p><b>UCTSIMP</b> {self._app_version}</p>"
+            "<p>Import IBKR CSV (vrátane Zrealizovaného súhrnu), prehľady a export pre daňové podklady.</p>"
+            f"<p>Každý kalendárny rok je v samostatnom súbore (priečinok <code>{DATA_DIR}</code>); "
+            f"zálohovanie a obnova v hornej lište.</p>"
+            "<p>Python / PySide6</p>",
+        )
+
+    def clear_imported_data(self) -> None:
+        reply = QMessageBox.warning(
+            self,
+            f"Vymazať dáta pre rok {self._active_year}",
+            "Z aktuálneho ročného súboru sa odstránia všetky transakcie a záznamy o importoch. "
+            "Ostatné roky ostanú v ich vlastných súboroch zmenené.\n\n"
+            f"Súbor: {self._current_db_path()}\n\n"
+            "Aplikácia sa tým neodinštaluje. Túto zmenu v rámci roka nie je možné vrátiť. "
+            "Súbory CSV a PDF na disku ostanú nedotknuté.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        n_tx, n_files = clear_all_data(self.connection)
+        self.refresh_tables()
+        self._set_status_line(
+            f"Rok {self._active_year} vyčistený: {n_tx} transakcií, {n_files} importov. {self._current_db_path()}"
+        )
+        QMessageBox.information(
+            self,
+            "Dáta vymazané",
+            f"Hotovo. Pre rok {self._active_year} bolo odstránených {n_tx} transakcií a {n_files} záznamov o súboroch.\n\n"
+            "Môžete spustiť čistý import (napr. Zrealizovaný súhrn).",
+        )
 
     def _on_overview_explain_toggled(self, checked: bool) -> None:
         self._overview_explain_box.setVisible(checked)
         self._overview_toggle.setArrowType(
+            Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow
+        )
+
+    def _on_tax_danove_toggled(self, checked: bool) -> None:
+        self._tax_danove_box.setVisible(checked)
+        self._tax_danove_toggle.setArrowType(
             Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow
         )
 
@@ -183,10 +454,10 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Import zlyhal", str(exc))
             return
 
-        self.status_label.setText(
-            "Import hotovy: "
-            f"{result.inserted} novych, "
-            f"{result.skipped_duplicates} duplicit, "
+        self._set_status_line(
+            "Import hotový: "
+            f"{result.inserted} nových, "
+            f"{result.skipped_duplicates} duplicít, "
             f"{result.total_rows} riadkov."
         )
         self.refresh_tables()
@@ -234,7 +505,7 @@ class MainWindow(QMainWindow):
         box.exec()
 
     def run_tests_dialog(self) -> None:
-        self.status_label.setText("Spustam testy (pytest)…")
+        self._set_status_line("Spúšťam testy (pytest)…")
         QApplication.processEvents()
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
@@ -246,7 +517,7 @@ class MainWindow(QMainWindow):
                     "Pytest",
                     f"Pri spusteni testu nastala chyba:\n{exc!r}",
                 )
-                self.status_label.setText("Testy: chyba spustenia (pozri dialog)")
+                self._set_status_line("Testy: chyba spustenia (pozri dialog)")
                 return
         finally:
             QApplication.restoreOverrideCursor()
@@ -273,9 +544,9 @@ class MainWindow(QMainWindow):
         box.setDetailedText(text)
         box.setStandardButtons(QMessageBox.StandardButton.Ok)
         box.exec()
-        self.status_label.setText(
-            f"Posledne testy: {'OK' if code == 0 else f'chyba (exit {code})'}. "
-            f"Databaza: {DEFAULT_DB_PATH}"
+        self._set_status_line(
+            f"Posledné testy: {'OK' if code == 0 else f'chyba (exit {code})'}. "
+            f"Rok {self._active_year}: {self._current_db_path()}"
         )
 
     def restart_application(self) -> None:
@@ -311,6 +582,11 @@ class MainWindow(QMainWindow):
             self.cashflow_table,
             cashflow_summary(self.connection),
             tax_split_cashflow(self.connection),
+        )
+        _fill_tax_rozpis(
+            self._tax_prijem_table,
+            self._tax_vydaj_table,
+            tax_danove_rozpis(self.connection),
         )
         _fill_daily_table(self.daily_table, daily_cumulative_net(self.connection))
         _fill_summary_table(self.ticker_table, ticker_summary(self.connection))
@@ -352,6 +628,28 @@ def _fill_cashflow_table(table: QTableWidget, cash, tax) -> None:
             item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
         table.setItem(i, 1, item)
     table.resizeColumnsToContents()
+
+
+def _fill_tax_rozpis(
+    prijem_table: QTableWidget,
+    vydaj_table: QTableWidget,
+    pair: tuple,
+) -> None:
+    p_rows, v_rows = pair
+    headers = ["ID", "Dátum", "Suma EUR", "Popis", "Zdroj"]
+    for table, lines in ((prijem_table, p_rows), (vydaj_table, v_rows)):
+        table.setColumnCount(len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.setRowCount(len(lines))
+        for i, x in enumerate(lines):
+            table.setItem(i, 0, QTableWidgetItem(str(x.transaction_id)))
+            table.setItem(i, 1, QTableWidgetItem(x.trade_date))
+            a = QTableWidgetItem(str(x.amount_eur))
+            a.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            table.setItem(i, 2, a)
+            table.setItem(i, 3, QTableWidgetItem(x.description))
+            table.setItem(i, 4, QTableWidgetItem(x.source))
+        table.resizeColumnsToContents()
 
 
 def _fill_daily_table(table: QTableWidget, rows) -> None:

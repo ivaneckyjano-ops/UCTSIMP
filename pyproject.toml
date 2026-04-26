@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "uctsimp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Desktop aplikacia na import IBKR CSV a pripravu danovych podkladov."
 readme = "README.md"
 requires-python = ">=3.11"

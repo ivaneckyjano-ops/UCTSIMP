@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from uctsimp.database import connect, import_raw
+from uctsimp.database import clear_all_data, connect, import_raw
 from uctsimp.ibkr_parser import parse_ibkr_csv
 from uctsimp.models import TransactionCategory
 from uctsimp.reports import (
@@ -56,6 +56,13 @@ def test_import_skips_duplicates(tmp_path: Path) -> None:
     assert first.skipped_duplicates == 0
     assert second.inserted == 0
     assert second.skipped_duplicates == 4
+
+    n_tx, n_f = clear_all_data(connection)
+    assert n_tx == 4
+    assert n_f == 1
+    third = import_raw(connection, parse_ibkr_csv(csv_path))
+    assert third.inserted == 4
+    assert third.skipped_duplicates == 0
 
 
 def test_reports_and_export(tmp_path: Path) -> None:

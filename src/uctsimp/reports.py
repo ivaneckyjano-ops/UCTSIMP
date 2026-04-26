@@ -4,8 +4,14 @@ import sqlite3
 from decimal import Decimal
 from pathlib import Path
 
-from .fifo_realized import fifo_danove_z_db
-from .models import CashflowSummary, DailyNetRow, SummaryRow, TaxSplitCashflow
+from .fifo_realized import fifo_danove_riadky_z_db, fifo_danove_z_db
+from .models import (
+    CashflowSummary,
+    DailyNetRow,
+    SummaryRow,
+    TaxDetailLine,
+    TaxSplitCashflow,
+)
 from .tax_relevance import sql_nedanove_kategorie_in
 
 GROSS_EUR_VYSVETLENIE = (
@@ -185,6 +191,62 @@ def tax_split_cashflow(connection: sqlite3.Connection) -> TaxSplitCashflow:
     )
 
 
+def tax_danove_rozpis(
+    connection: sqlite3.Connection,
+) -> tuple[list[TaxDetailLine], list[TaxDetailLine]]:
+    """
+    Riadky do daňovej kontroly: ostatné kategórie podľa Net EUR,
+    obchody ako samostatné FIFO realizácie (uzatvorenie).
+    Suma vo výdajoch je vždy kladná (veľkosť výdaja / straty).
+    """
+    in_list = sql_nedanove_kategorie_in()
+    prijem: list[TaxDetailLine] = []
+    vydaj: list[TaxDetailLine] = []
+    cur = connection.execute(
+        f"""
+        SELECT id, trade_date, description, net_amount_eur, category, transaction_type
+        FROM transactions
+        WHERE category != 'trade'
+          AND category NOT IN ({in_list})
+        ORDER BY trade_date, id
+        """
+    )
+    for r in cur.fetchall():
+        tid = int(r["id"])
+        td = str(r["trade_date"])
+        desc = (r["description"] or "").strip()
+        if len(desc) > 400:
+            desc = desc[:397] + "..."
+        net = _decimal_from_sql(r["net_amount_eur"])
+        cat = str(r["category"])
+        typ = (r["transaction_type"] or "").strip()
+        src = cat if not typ else f"{cat} · {typ}"
+        if net > 0:
+            prijem.append(TaxDetailLine(tid, td, net, desc, src))
+        elif net < 0:
+            vydaj.append(TaxDetailLine(tid, td, -net, desc, src))
+    for line in fifo_danove_riadky_z_db(connection):
+        if line.amount_eur > 0:
+            prijem.append(line)
+        elif line.amount_eur < 0:
+            vydaj.append(
+                TaxDetailLine(
+                    line.transaction_id,
+                    line.trade_date,
+                    -line.amount_eur,
+                    line.description,
+                    line.source,
+                )
+            )
+
+    def _key(x: TaxDetailLine) -> tuple[str, int]:
+        return (x.trade_date, x.transaction_id)
+
+    prijem.sort(key=_key)
+    vydaj.sort(key=_key)
+    return (prijem, vydaj)
+
+
 def daily_cumulative_net(connection: sqlite3.Connection) -> list[DailyNetRow]:
     """Denné súčty Net EUR a kumulatív od prvého dátumu v (importe) databáze."""
     cur = connection.execute(
@@ -285,6 +347,22 @@ def export_excel(connection: sqlite3.Connection, path: str | Path) -> None:
             GROSS_EUR_VYSVETLENIE.replace("\n\n", " ").replace("**", ""),
         ]
     )
+
+    pri_roz, vyd_roz = tax_danove_rozpis(connection)
+    roz_sheet = workbook.create_sheet("DanRozpis")
+    roz_sheet.append(["Prijem (dan) - detail"])
+    roz_sheet.append(["ID", "Datum", "Suma_EUR", "Popis", "Zdroj"])
+    for x in pri_roz:
+        roz_sheet.append(
+            [x.transaction_id, x.trade_date, float(x.amount_eur), x.description, x.source]
+        )
+    roz_sheet.append([])
+    roz_sheet.append(["Vydaj (dan) - detail"])
+    roz_sheet.append(["ID", "Datum", "Suma_EUR", "Popis", "Zdroj"])
+    for x in vyd_roz:
+        roz_sheet.append(
+            [x.transaction_id, x.trade_date, float(x.amount_eur), x.description, x.source]
+        )
 
     kum_sheet = workbook.create_sheet("Kumulativ")
     kum_sheet.append(["Datum", "Denna zmena Net EUR", "Kumulativ Net EUR"])

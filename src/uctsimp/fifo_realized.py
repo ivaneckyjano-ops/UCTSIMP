@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Final
 
+from .models import TaxDetailLine
+
 MONEY: Final = Decimal("0.01")
 
 
@@ -18,6 +20,7 @@ MONEY: Final = Decimal("0.01")
 class TradeForFifo:
     id: int
     symbol: str
+    description: str
     trade_date: str
     transaction_type: str
     quantity: Decimal
@@ -36,6 +39,9 @@ def _row_to_trade(r: sqlite3.Row) -> TradeForFifo:
     id_ = int(r["id"])
     sym = r["symbol"]
     sym = "" if sym in (None, "") else str(sym)
+    desc = (r["description"] or "").strip()
+    if len(desc) > 500:
+        desc = desc[:497] + "..."
     td = str(r["trade_date"])
     tt = (r["transaction_type"] or "").strip().lower()
     qty = _d(r["quantity"])
@@ -45,6 +51,7 @@ def _row_to_trade(r: sqlite3.Row) -> TradeForFifo:
     return TradeForFifo(
         id=id_,
         symbol=sym,
+        description=desc,
         trade_date=td,
         transaction_type=tt,
         quantity=qty,
@@ -56,7 +63,7 @@ def _load_trades(conn: sqlite3.Connection) -> list[TradeForFifo]:
     out: list[TradeForFifo] = []
     cur = conn.execute(
         """
-        SELECT id, symbol, trade_date, transaction_type, quantity, net_amount_eur
+        SELECT id, symbol, description, trade_date, transaction_type, quantity, net_amount_eur
         FROM transactions
         WHERE category = 'trade'
         ORDER BY trade_date, id
@@ -75,14 +82,19 @@ def group_trades_by_symbol(rows: list[TradeForFifo]) -> dict[str, list[TradeForF
     return g
 
 
-def _fifo_for_symbol_rows(rows: list[TradeForFifo]) -> tuple[Decimal, Decimal, Decimal]:
-    """(prijem z klad. realiz, vydaj = |zap. realiz|, suma realiz)."""
-    longs: deque[tuple[Decimal, Decimal]] = deque()  # (mnozstvo, cena_za_1 EUR)
-    shorts: deque[tuple[Decimal, Decimal]] = deque()  # (mnozstvo, pripis za 1 pri shorte)
-
+def _fifo_for_symbol_rows(
+    rows: list[TradeForFifo],
+) -> tuple[Decimal, Decimal, Decimal, list[TaxDetailLine]]:
+    longs: deque[tuple[Decimal, Decimal]] = deque()
+    shorts: deque[tuple[Decimal, Decimal]] = deque()
     p_plus = Decimal("0")
     p_abs = Decimal("0")
     cist = Decimal("0")
+    lines: list[TaxDetailLine] = []
+
+    def _src(tr: TradeForFifo) -> str:
+        sym = tr.symbol or "—"
+        return f"FIFO {tr.transaction_type} · {sym}"
 
     for tr in rows:
         net = tr.net_amount_eur
@@ -107,6 +119,15 @@ def _fifo_for_symbol_rows(rows: list[TradeForFifo]) -> tuple[Decimal, Decimal, D
                     p_plus += rlz
                 elif rlz < 0:
                     p_abs += -rlz
+                lines.append(
+                    TaxDetailLine(
+                        transaction_id=tr.id,
+                        trade_date=tr.trade_date,
+                        amount_eur=rlz,
+                        description=tr.description,
+                        source=_src(tr) + " (cover short)",
+                    )
+                )
                 nsh = sh_qty - take
                 if nsh <= 0:
                     shorts.popleft()
@@ -136,6 +157,15 @@ def _fifo_for_symbol_rows(rows: list[TradeForFifo]) -> tuple[Decimal, Decimal, D
                     p_plus += rlz
                 elif rlz < 0:
                     p_abs += -rlz
+                lines.append(
+                    TaxDetailLine(
+                        transaction_id=tr.id,
+                        trade_date=tr.trade_date,
+                        amount_eur=rlz,
+                        description=tr.description,
+                        source=_src(tr) + " (predaj z long)",
+                    )
+                )
                 nlq = lq - take
                 if nlq <= 0:
                     longs.popleft()
@@ -148,21 +178,33 @@ def _fifo_for_symbol_rows(rows: list[TradeForFifo]) -> tuple[Decimal, Decimal, D
                 pr = (proc_left / rem).quantize(MONEY, rounding=ROUND_HALF_UP)
                 shorts.append((rem, pr))
 
-    return (p_plus, p_abs, cist)
+    return (p_plus, p_abs, cist, lines)
 
 
 def fifo_danove_obchodne_toky(
     trades_by_symbol: dict[str, list[TradeForFifo]],
-) -> tuple[Decimal, Decimal, Decimal]:
+) -> tuple[Decimal, Decimal, Decimal, list[TaxDetailLine]]:
     t_plus = t_abs = t_c = Decimal("0")
+    all_lines: list[TaxDetailLine] = []
     for symbol in sorted(trades_by_symbol.keys()):
-        a, b, c = _fifo_for_symbol_rows(trades_by_symbol[symbol])
+        a, b, c, ev = _fifo_for_symbol_rows(trades_by_symbol[symbol])
         t_plus += a
         t_abs += b
         t_c += c
-    return (t_plus, t_abs, t_c)
+        all_lines.extend(ev)
+    return (t_plus, t_abs, t_c, all_lines)
 
 
 def fifo_danove_z_db(conn: sqlite3.Connection) -> tuple[Decimal, Decimal, Decimal]:
     rows = _load_trades(conn)
-    return fifo_danove_obchodne_toky(group_trades_by_symbol(rows))
+    a, b, c, _ = fifo_danove_obchodne_toky(group_trades_by_symbol(rows))
+    return (a, b, c)
+
+
+def fifo_danove_riadky_z_db(
+    conn: sqlite3.Connection,
+) -> list[TaxDetailLine]:
+    """Vsetky riadky FIFO realizacie (na rozdelenie + / - v reports)."""
+    rows = _load_trades(conn)
+    _, _, _, ev = fifo_danove_obchodne_toky(group_trades_by_symbol(rows))
+    return ev

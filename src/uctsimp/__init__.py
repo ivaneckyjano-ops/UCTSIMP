@@ -1,3 +1,5 @@
 """UCTSIMP - IBKR import and tax reporting helpers."""
 
-__version__ = "0.1.0"
+from .version_info import get_package_version
+
+__version__ = get_package_version()
